@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+import re
 
 from llm_client import client, MODEL
 from memory import SemanticMemory, SlidingWindowBuffer
@@ -51,32 +52,63 @@ from tools import TOOL_SCHEMAS, dispatch_tool
 
 MAX_ITERATIONS = 10   # Hard ceiling on agentic loop iterations.
 
-SYSTEM_PROMPT = """You are a Coder Agent.  Your job is to complete coding tasks
-by reasoning step-by-step and using the available tools.
+
+SYSTEM_PROMPT = """You are a Coder Agent. Your job is to complete coding tasks
+by reasoning carefully and using the available tools.
+
+## Available tools
+
+You may use ONLY these three tools:
+- read_file: Read a file from the workspace. Argument: {{"path": "filename"}}
+- write_file: Write a file in the works
+  {{"path": "filename", "content": "complete file content"}}
+- exec_python: Execute Python code to test your work. Argument:
+  {{"code": "Python source code"}}
+
+Use the exact tool names: read_file, write_file, exec_python.
+Never use namespaces, prefixes, parallel tool calls, or other tool names.
+All file paths passed to read_file and write_file are relative to the workspace root.
+NEVER include "workspace/" or "workspace\\" at the beginning of a file path.
+For example, use "word_frequency.py", NOT "workspace/word_frequency.py".
+The tools automatically add the workspace directory.
+When executing Python, remember that code runs in a temporary script,
+not necessarily from the workspace directory. Use workspace-relative paths
+or absolute paths only when appropriate and permitted.
 
 ## Response format
 
-Every response MUST use EXACTLY one of the two formats below.
+Every response MUST use EXACTLY one of these formats.
 
-FORMAT A – when you need to call a tool:
-    Thought: <your reasoning about what to do next>
-    Action: <tool_name>
-    Action Input: <valid JSON object with the tool's arguments>
+FORMAT A - when calling a tool:
+Thought: <brief explanation of the next step>
+Action: <exact tool name>
+Action Input: <single-line valid JSON object>
 
-FORMAT B – when the task is complete:
-    Thought: <brief explanation of what you produced>
-    FINAL ANSWER: <the deliverable: code, explanation, result, or a file path>
+FORMAT B - when the task is complete:
+Thought: <brief explanation of the result>
+FINAL ANSWER: <deliverable, result, or relevant file path>
 
 ## Rules
 
-- Always emit a Thought before every Action or FINAL ANSWER.
+- Always provide a Thought before every Action or FINAL ANSWER.
 - Action Input must be a single-line valid JSON object.
-- Never invent tool results; always wait for the Observation.
-- If a tool returns an ERROR, try to fix the issue rather than repeating
-  the same call.
-- Stop and emit FINAL ANSWER as soon as the task is complete.
-- You have a maximum of {max_iter} iterations.  Use them wisely.
+- Make ONE tool call per response. Never bundle tools together.
+- Never invent tool results; wait for the Observation.
+- If a tool returns an ERROR, understand it and try a different approach.
+- After writing code, verify it with exec_python whenever practical.
+- exec_python runs a temporary Python script. Do not assume its current
+  working directory is the project root or workspace.
+- Do not assume workspace modules can be imported by their filename alone.
+- For testing a generated file, use read_file to inspect its contents first.
+  Then use exec_python with a self-contained test when practical, or explicitly
+  set up the correct import path and file paths.
+- Pass workspace-relative paths to read_file and write_file, without a
+  workspace/ prefix.
+- For exec_python, include any required setup and file paths in the code.
+- Stop and return FINAL ANSWER once the task is complete.
+- You have a maximum of {max_iter} iterations. Use them wisely.
 """.format(max_iter=MAX_ITERATIONS)
+
 
 
 # ── Output schema ─────────────────────────────────────────────────────────────
@@ -134,7 +166,18 @@ def build_system_prompt(semantic_memory: SemanticMemory, task: str) -> str:
     str
         The complete system prompt, with memories appended if available.
     """
-    raise NotImplementedError("TODO: implement build_system_prompt()")
+    if semantic_memory.count() == 0:
+        return SYSTEM_PROMPT
+
+    memories = semantic_memory.retrieve(task, top_k=3)
+
+    if not memories:
+        return SYSTEM_PROMPT
+
+    memory_section = "\n\n## Relevant memories\n"
+    memory_section += "\n".join(f"- {memory}" for memory in memories)
+
+    return SYSTEM_PROMPT + memory_section
 
 
 def parse_llm_response(response_text: str) -> dict[str, Any]:
@@ -184,7 +227,49 @@ def parse_llm_response(response_text: str) -> dict[str, Any]:
     dict
         A structured dict with the keys described above.
     """
-    raise NotImplementedError("TODO: implement parse_llm_response()")
+
+    thought = ""
+    thought_match = re.search(
+        r"Thought:\s*(.*?)(?=\n(?:Action:|FINAL ANSWER:)|\Z)",
+        response_text,
+        re.DOTALL,
+    )
+    if thought_match:
+        thought = thought_match.group(1).strip()
+
+    final_match = re.search(r"FINAL ANSWER:\s*(.*)", response_text, re.DOTALL)
+    if final_match:
+        return {
+            "thought": thought,
+            "final_answer": final_match.group(1).strip(),
+        }
+
+    action_match = re.search(r"Action:\s*(.+)", response_text)
+    input_match = re.search(r"Action Input:\s*(.*)", response_text, re.DOTALL)
+
+    action = action_match.group(1).strip() if action_match else ""
+
+    if not action or not input_match:
+        return {
+            "thought": thought,
+            "parse_error": "Could not find a valid Action and Action Input.",
+        }
+
+    try:
+        action_input = json.loads(input_match.group(1).strip())
+    except json.JSONDecodeError as error:
+        return {
+            "thought": thought,
+            "action": action,
+            "parse_error": str(error),
+        }
+
+    return {
+        "thought": thought,
+        "action": action,
+        "action_input": action_input,
+    }
+
 
 
 def run_agent(task: str) -> AgentResult:
@@ -235,7 +320,71 @@ def run_agent(task: str) -> AgentResult:
         Structured result including the final answer, iteration count,
         and a log of all tool calls made.
     """
-    raise NotImplementedError("TODO: implement run_agent()")
+    
+    buffer = SlidingWindowBuffer()
+    semantic_memory = SemanticMemory()
+    tool_calls = []
+
+    system_prompt = build_system_prompt(semantic_memory, task)
+    buffer.set_system(system_prompt)
+    buffer.add("user", task)
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=buffer.messages(),
+            tools=TOOL_SCHEMAS,
+            tool_choice="none",
+        )
+
+        assistant_text = response.choices[0].message.content or ""
+        buffer.add("assistant", assistant_text)
+
+        parsed = parse_llm_response(assistant_text)
+
+        if "final_answer" in parsed:
+            final_answer = parsed["final_answer"]
+            semantic_memory.store(
+                "Task: " + task + "\nAnswer: " + final_answer
+            )
+
+            return AgentResult(
+                answer=final_answer,
+                iterations=iteration,
+                tool_calls=tool_calls,
+                stopped_early=False,
+            )
+
+        if "parse_error" in parsed:
+            observation = "OBSERVATION: Parse error – " + parsed["parse_error"]
+            buffer.add("user", observation)
+            continue
+
+        action = parsed["action"]
+        action_input = parsed["action_input"]
+
+        tool_result = dispatch_tool(action, action_input)
+
+        tool_calls.append({
+            "tool": action,
+            "args": action_input,
+            "result": tool_result,
+        })
+
+        observation = "OBSERVATION: " + str(tool_result)
+
+        if not observation.startswith("OBSERVATION: ERROR"):
+            semantic_memory.store(observation)
+
+        buffer.add("user", observation)
+
+    return AgentResult(
+        answer="MAX_ITERATIONS reached",
+        iterations=MAX_ITERATIONS,
+        tool_calls=tool_calls,
+        stopped_early=True,
+    )
+
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -244,8 +393,8 @@ DEMO_TASK = (
     "Write a Python function called word_frequency(filepath: str) -> dict "
     "that reads a text file and returns a dictionary mapping each word to "
     "the number of times it appears.  The function should be case-insensitive "
-    "and ignore punctuation.  Write the function to workspace/word_frequency.py, "
-    "then write a small test script to workspace/test_word_frequency.py that "
+    "and ignore punctuation. Write the function to word_frequency.py, "
+    "then write a small test script to test_word_frequency.py that "
     "creates a sample file, calls the function, and prints the result.  "
     "Finally, run the test script and confirm it produces output."
 )
@@ -253,3 +402,9 @@ DEMO_TASK = (
 if __name__ == "__main__":
     result = run_agent(DEMO_TASK)
     print(result)
+
+    for index, call in enumerate(result.tool_calls, start=1):
+        print(f"\n--- Tool Call {index} ---")
+        print("Tool:", call["tool"])
+        print("Arguments:", call["args"])
+        print("Result:", call["result"])
